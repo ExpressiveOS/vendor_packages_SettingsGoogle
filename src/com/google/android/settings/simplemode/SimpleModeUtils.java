@@ -7,8 +7,11 @@ import android.content.ComponentName;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.Intent;
 import android.content.om.IOverlayManager;
+import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.RemoteException;
@@ -17,6 +20,7 @@ import android.os.SystemProperties;
 import android.os.Trace;
 import android.os.UserHandle;
 import android.provider.Settings;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.WindowManagerGlobal;
 import android.view.WindowManagerPolicyConstants;
@@ -54,6 +58,10 @@ public abstract class SimpleModeUtils {
             "simple_mode_data_store_data_for_feature_toggle";
     private static final String DATA_STORE_BACKUP_RESTORE =
             "simple_mode_data_store_data_for_backup_restore";
+    // Launcher3 names its grid provider in this Home activity meta-data
+    private static final String GRID_CONTROL_METADATA = "com.android.launcher3.grid.control";
+    private static final String DEFAULT_GRID_CONTROL_AUTHORITY =
+            "com.google.android.apps.nexuslauncher.grid_control";
     private static final Executor sExecutor = Executors.newSingleThreadExecutor();
     private static final ImmutableList<String> ONE_GRID_OPTION =
             ImmutableList.of("small", "medium", "large", "xl");
@@ -117,10 +125,44 @@ public abstract class SimpleModeUtils {
         return WindowManagerPolicyConstants.NAV_BAR_MODE_GESTURAL_OVERLAY;
     }
 
-    private static Uri getUriForGridOption(String path) {
+    private static String getGridControlAuthority(ActivityInfo activityInfo) {
+        if (activityInfo == null || activityInfo.metaData == null) {
+            return null;
+        }
+        String authority = activityInfo.metaData.getString(GRID_CONTROL_METADATA);
+        return TextUtils.isEmpty(authority) ? null : authority;
+    }
+
+    // The Home app's grid provider; during setup, the first built-in launcher's
+    private static String getGridControlAuthority(Context context) {
+        PackageManager packageManager = context.getPackageManager();
+        Intent homeIntent = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME);
+        ResolveInfo home =
+                packageManager.resolveActivity(
+                        homeIntent,
+                        PackageManager.MATCH_DEFAULT_ONLY | PackageManager.GET_META_DATA);
+        String authority = home != null ? getGridControlAuthority(home.activityInfo) : null;
+        if (authority != null) {
+            return authority;
+        }
+        for (ResolveInfo info :
+                packageManager.queryIntentActivities(
+                        homeIntent,
+                        PackageManager.MATCH_DEFAULT_ONLY
+                                | PackageManager.MATCH_SYSTEM_ONLY
+                                | PackageManager.GET_META_DATA)) {
+            authority = getGridControlAuthority(info.activityInfo);
+            if (authority != null) {
+                return authority;
+            }
+        }
+        return DEFAULT_GRID_CONTROL_AUTHORITY;
+    }
+
+    private static Uri getUriForGridOption(Context context, String path) {
         return new Uri.Builder()
                 .scheme("content")
-                .authority("com.google.android.apps.nexuslauncher.grid_control")
+                .authority(getGridControlAuthority(context))
                 .appendPath(path)
                 .build();
     }
@@ -145,8 +187,8 @@ public abstract class SimpleModeUtils {
                         .getStringArray(R.array.long_press_timeout_selector_values)[1]);
     }
 
-    private static Uri getUriForSetDefaultGrid() {
-        return getUriForGridOption("default_grid");
+    private static Uri getUriForSetDefaultGrid(Context context) {
+        return getUriForGridOption(context, "default_grid");
     }
 
     protected static void setFeatureToggleStatus(Context context, int status) {
@@ -157,7 +199,12 @@ public abstract class SimpleModeUtils {
         String gridOption = "small";
         try (Cursor cursor =
                 context.getContentResolver()
-                        .query(getUriForGridOption("list_options"), null, null, null, null)) {
+                        .query(
+                                getUriForGridOption(context, "list_options"),
+                                null,
+                                null,
+                                null,
+                                null)) {
             while (cursor.moveToNext()) {
                 String name = cursor.getString(cursor.getColumnIndex("name"));
                 if (Boolean.parseBoolean(cursor.getString(cursor.getColumnIndex("is_default")))) {
@@ -596,8 +643,16 @@ public abstract class SimpleModeUtils {
                 gridOption = remapToOneGridOption(gridOption);
                 Log.d(TAG, "remapToOneGridOption: " + gridOption);
             }
-            contentResolver.update(
-                    getUriForSetDefaultGrid(), getGridOptionContentValue(gridOption), null, null);
+            // A Home app without this provider must not crash Settings
+            try {
+                contentResolver.update(
+                        getUriForSetDefaultGrid(context),
+                        getGridOptionContentValue(gridOption),
+                        null,
+                        null);
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Failed to set the launcher grid to " + gridOption, e);
+            }
         }
     }
 
